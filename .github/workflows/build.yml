@@ -31,7 +31,10 @@ jobs:
           7z x (Get-ChildItem mpvdev -Filter *.7z).FullName -ompv
           Copy-Item (Get-ChildItem mpv -Recurse -Filter libmpv-2.dll).FullName .
       - name: Build exe
-        run: pyinstaller --noconfirm --windowed --name ClipTrimmer --add-data "ffbin;ffmpeg" --add-binary "libmpv-2.dll;." --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtPdf --exclude-module PySide6.QtNetwork cliptrimmer.py
+        run: pyinstaller --noconfirm --windowed --name ClipTrimmer --add-binary "libmpv-2.dll;." --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtPdf --exclude-module PySide6.QtNetwork cliptrimmer.py
+      - name: Add ffmpeg (copied in after the build so PyInstaller does not duplicate its DLLs)
+        shell: pwsh
+        run: Copy-Item ffbin "dist/ClipTrimmer/_internal/ffmpeg" -Recurse
       - name: Strip unused Qt parts
         shell: pwsh
         run: |
