@@ -11,15 +11,16 @@ if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(str(BUNDLE / "ffmpeg"))
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF
-from PySide6.QtGui import QPainter, QColor, QShortcut, QKeySequence
+from PySide6.QtGui import QPainter, QColor, QShortcut, QKeySequence, QPalette
 from PySide6.QtWidgets import (QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QListWidget,
-                               QListWidgetItem, QComboBox, QPushButton, QLabel, QFileDialog, QMessageBox, QCheckBox, QInputDialog)
+                               QListWidgetItem, QComboBox, QPushButton, QLabel, QFileDialog, QMessageBox, QCheckBox, QInputDialog, QMenu, QStyledItemDelegate, QStyle,
+                               QStyleOptionViewItem)
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", HERE)) / "ClipTrimmer"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG = CONFIG_DIR / "config.json"
 LOGFILE = CONFIG_DIR / "cliptrimmer.log"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 logging.basicConfig(handlers=[logging.handlers.RotatingFileHandler(LOGFILE, maxBytes=1_000_000, backupCount=2,
                     encoding="utf-8")], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ct")
@@ -34,6 +35,40 @@ sys.excepthook = _excepthook
 EXTS = {".mp4", ".mkv", ".mov"}
 EDIT_LIST_EXTS = {".mp4", ".mov", ".m4v"}  # containers that can hide the lead-in frames of a stream-copy cut
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+class ClipDelegate(QStyledItemDelegate):
+    """Draws the clip name on the left and its file size right-aligned."""
+    def sizeHint(self, opt, idx):
+        sh = super().sizeHint(opt, idx)
+        sh.setWidth(0)  # always use the list's width, so long names get elided instead of scrolling
+        return sh
+
+    def paint(self, p, opt, idx):
+        o = QStyleOptionViewItem(opt)
+        self.initStyleOption(o, idx)
+        text, size = o.text, idx.data(Qt.UserRole + 1) or ""
+        o.text = ""
+        style = o.widget.style() if o.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, o, p, o.widget)
+        selected = bool(o.state & QStyle.State_Selected)
+        fm, pad = o.fontMetrics, 8
+        sw = fm.horizontalAdvance(size)
+        p.save()
+        p.setPen(o.palette.color(QPalette.HighlightedText if selected else QPalette.Text))
+        name_rect = o.rect.adjusted(pad, 0, -(sw + pad * 2), 0)
+        p.drawText(name_rect, Qt.AlignVCenter | Qt.AlignLeft, fm.elidedText(text, Qt.ElideMiddle, name_rect.width()))
+        if not selected:
+            p.setPen(o.palette.color(QPalette.PlaceholderText))
+        p.drawText(o.rect.adjusted(0, 0, -pad, 0), Qt.AlignVCenter | Qt.AlignRight, size)
+        p.restore()
 
 
 def fmt(t):
@@ -256,6 +291,10 @@ class Main(QMainWindow):
         self.tl.changed.connect(self.refresh_info)
         self.game.currentIndexChanged.connect(self.fill_list)
         self.list.currentRowChanged.connect(self.open_row)
+        self.list.setItemDelegate(ClipDelegate(self.list))
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self.clip_menu)
         self.timer = QTimer(self, interval=30, timeout=self.tick)
         self.timer.start()
         QApplication.instance().applicationStateChanged.connect(
@@ -280,7 +319,7 @@ class Main(QMainWindow):
             for f in files:
                 if Path(f).suffix.lower() in EXTS:
                     p = Path(dp) / f
-                    found.append((Path(dp).name if Path(dp) != root else "(Other)", p, p.stat().st_mtime))
+                    found.append((Path(dp).name if Path(dp) != root else "(Other)", p, p.stat().st_mtime, p.stat().st_size))
         self.clips = sorted(found, key=lambda c: -c[2])
         games, prev = sorted({c[0] for c in self.clips}), self.game.currentText()
         self.game.blockSignals(True)
@@ -296,11 +335,48 @@ class Main(QMainWindow):
         self.list.blockSignals(True)
         self.list.clear()
         self.shown = [c for c in self.clips if g in ("All games", c[0])]
-        for _, p, _ in self.shown:
-            self.list.addItem(QListWidgetItem(p.name))
+        for _, p, _, size in self.shown:
+            item = QListWidgetItem(p.name)
+            item.setData(Qt.UserRole + 1, fmt_size(size))
+            item.setToolTip(str(p))
+            self.list.addItem(item)
             if p == cur:
                 self.list.setCurrentRow(self.list.count() - 1)
         self.list.blockSignals(False)
+
+    def clip_menu(self, pos):
+        item = self.list.itemAt(pos)
+        if not item:
+            return
+        row = self.list.row(item)
+        menu = QMenu(self)
+        act = menu.addAction("Delete…")
+        if menu.exec(self.list.viewport().mapToGlobal(pos)) is act:
+            self.delete_clip(self.shown[row][1])
+
+    def delete_clip(self, p):
+        size = fmt_size(p.stat().st_size) if p.exists() else "?"
+        box = QMessageBox(QMessageBox.Warning, "Delete clip",
+                          f"Are you sure you want to delete this clip?\n\n{p.name}  ({size})\n\n"
+                          "It will be moved to the Recycle Bin.", QMessageBox.Yes | QMessageBox.No, self)
+        box.setDefaultButton(QMessageBox.No)
+        if box.exec() != QMessageBox.Yes:
+            return
+        try:
+            from send2trash import send2trash
+            if self.cur == p:
+                self.player.command("stop")  # release the file lock on Windows
+                self.cur = None
+                self.tl.dur, self.tl.a, self.tl.b, self.tl.pos = 1.0, 0.0, 1.0, 0.0
+                self.tl.update()
+                self.info.setText("")
+            send2trash(str(p))
+            log.info("DELETE %s (moved to Recycle Bin)", p)
+            self.status.setText(f"Deleted: {p.name}")
+        except Exception as ex:
+            log.exception("DELETE failed")
+            QMessageBox.critical(self, "Delete failed", f"{ex}\n\nDetails are in the log: {LOGFILE}")
+        self.scan()
 
     def open_row(self, i):
         if i >= 0:
