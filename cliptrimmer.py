@@ -13,13 +13,13 @@ if hasattr(os, "add_dll_directory"):
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QPainter, QColor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QListWidget,
-                               QListWidgetItem, QComboBox, QPushButton, QLabel, QFileDialog, QMessageBox, QCheckBox)
+                               QListWidgetItem, QComboBox, QPushButton, QLabel, QFileDialog, QMessageBox, QCheckBox, QInputDialog)
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", HERE)) / "ClipTrimmer"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG = CONFIG_DIR / "config.json"
 LOGFILE = CONFIG_DIR / "cliptrimmer.log"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 logging.basicConfig(handlers=[logging.handlers.RotatingFileHandler(LOGFILE, maxBytes=1_000_000, backupCount=2,
                     encoding="utf-8")], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ct")
@@ -108,16 +108,31 @@ def verify(src, dst, s, e):
     return None
 
 
+def unique_path(p):
+    out, n = p, 2
+    while out.exists():
+        out = p.with_name(f"{p.stem} ({n}){p.suffix}")
+        n += 1
+    return out
+
+
 def edit_name(p):
     m = re.match(r"^(.*?) (\d{4}\.\d{2}\.\d{2} - .+)$", p.name)
     name = f"{m[1]} [EDIT] {m[2]}" if m else f"{p.stem} [EDIT]{p.suffix}"
     if "[EDIT]" in p.name:
         name = p.name  # already an edit: just number it
-    out, n = p.with_name(name), 2
-    while out.exists():
-        out = p.with_name(Path(name).stem + f" ({n})" + p.suffix)
-        n += 1
-    return out
+    return unique_path(p.with_name(name))
+
+
+def custom_name(src, text):
+    """Turn what the user typed into a safe file path next to src, or None to use the default scheme."""
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", text).strip()
+    if text.lower().endswith(src.suffix.lower()):
+        text = text[: -len(src.suffix)]
+    text = text.rstrip(". ")
+    if not text or text == src.stem:
+        return None
+    return unique_path(src.with_name(text + src.suffix))
 
 
 # ---------------------------------------------------------------- timeline widget
@@ -334,6 +349,13 @@ class Main(QMainWindow):
                 "Replace the original with the trimmed version?\nThe original goes to the Recycle Bin.") != QMessageBox.Yes:
             return
         out = edit_name(src)
+        if not replace:
+            text, ok = QInputDialog.getText(self, "Save as new", "File name (leave unchanged to use the default [EDIT] name):",
+                                            text=src.stem)
+            if not ok:
+                return
+            out = custom_name(src, text) or out
+            log.info("EXPORT name chosen: %s", out.name)
         tmp = src.with_name(src.stem + ".trimming" + src.suffix)
         target = tmp if replace else out
         self.status.setText("Exporting…")
