@@ -19,7 +19,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", HERE)) / "ClipTrimmer"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG = CONFIG_DIR / "config.json"
 LOGFILE = CONFIG_DIR / "cliptrimmer.log"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 logging.basicConfig(handlers=[logging.handlers.RotatingFileHandler(LOGFILE, maxBytes=1_000_000, backupCount=2,
                     encoding="utf-8")], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ct")
@@ -32,6 +32,7 @@ def _excepthook(t, v, tb):
 
 sys.excepthook = _excepthook
 EXTS = {".mp4", ".mkv", ".mov"}
+EDIT_LIST_EXTS = {".mp4", ".mov", ".m4v"}  # containers that can hide the lead-in frames of a stream-copy cut
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -49,7 +50,7 @@ def run(cmd):
 
 def probe(path):
     """Return dict with video size/codec/fps and audio track count."""
-    r = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate:format=duration",
+    r = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,start_time:format=duration",
              "-of", "json", path])
     try:
         d = json.loads(r.stdout)
@@ -57,6 +58,8 @@ def probe(path):
         v = next((x for x in st if x.get("codec_type") == "video"), {})
         return {"codec": v.get("codec_name"), "w": v.get("width"), "h": v.get("height"), "fps": v.get("r_frame_rate"),
                 "audio": sum(1 for x in st if x.get("codec_type") == "audio"),
+                "vstart": float(v.get("start_time") or 0),
+                "astarts": [float(x.get("start_time") or 0) for x in st if x.get("codec_type") == "audio"],
                 "dur": float(d.get("format", {}).get("duration", 0))}
     except Exception:
         log.exception("probe failed for %s", path)
@@ -75,13 +78,17 @@ def encoder_args(src):
 def trim(src, s, e, dst, clean):
     """Lossless mode: video/audio are stream-copied (bit-exact); the cut start is exact on playback.
     Clean mode: video is re-encoded near-lossless (NVENC) so the file contains only the trimmed range."""
-    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{s}", "-i", src, "-t", f"{e - s}",
+    # Clean mode seeks in two steps (fast jump, then frame-exact trim) so audio and video stay in sync.
+    pre = max(0.0, s - 5.0) if clean else s
+    fine = ["-ss", f"{s - pre}"] if clean and s - pre > 0 else []
+    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{pre}", "-i", src] + fine + ["-t", f"{e - s}",
             "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn"]
+    mov = ["-movflags", "+faststart"] if Path(dst).suffix.lower() in EDIT_LIST_EXTS else []
     if clean:
         nv, cpu = encoder_args(src)
-        attempts = [base + enc + ["-c:a", "copy", "-movflags", "+faststart", dst] for enc in (nv, cpu)]
+        attempts = [base + enc + ["-c:a", "copy"] + mov + [dst] for enc in (nv, cpu)]
     else:
-        attempts = [base + ["-c", "copy", "-movflags", "+faststart", dst]]
+        attempts = [base + ["-c", "copy"] + mov + [dst]]
     err = ""
     for cmd in attempts:
         r = run(cmd)
@@ -101,6 +108,9 @@ def verify(src, dst, s, e):
         return f"audio tracks: expected {a.get('audio')}, got {b.get('audio')}"
     if abs(b.get("dur", 0) - (e - s)) > 0.75:
         return f"duration {b.get('dur', 0):.2f}s, expected about {e - s:.2f}s"
+    for st in b.get("astarts", []):
+        if abs(st - b.get("vstart", 0)) > 0.25:
+            return f"audio and video start {abs(st - b.get('vstart', 0)):.2f}s apart (out of sync)"
     for args in (["-t", "2"], ["-sseof", "-2"]):  # decode start and end to catch broken frames
         r = run(["ffmpeg", "-v", "error"] + args + ["-i", dst, "-f", "null", "-"])
         if r.returncode != 0 or "error" in r.stderr.lower():
@@ -344,6 +354,9 @@ class Main(QMainWindow):
         if not self.cur:
             return
         src, s, e, clean = self.cur, self.tl.a, self.tl.b, self.clean.isChecked()
+        if not clean and src.suffix.lower() not in EDIT_LIST_EXTS:
+            clean = True  # e.g. MKV cannot hide lead-in frames, so a copy would start too early
+            log.info("Non-MP4 container (%s): using clean cut for an exact start", src.suffix)
         log.info("EXPORT replace=%s clean=%s src=%s start=%.3f end=%.3f", replace, clean, src, s, e)
         if replace and QMessageBox.question(self, "Replace original",
                 "Replace the original with the trimmed version?\nThe original goes to the Recycle Bin.") != QMessageBox.Yes:
