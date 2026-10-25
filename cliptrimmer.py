@@ -1,5 +1,5 @@
 """ClipTrimmer - view and trim NVIDIA Instant Replay clips (smart cut, near-lossless)."""
-import os, sys, re, json, locale, shutil, subprocess, tempfile
+import os, sys, re, json, locale, shutil, subprocess, tempfile, logging, logging.handlers, traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -11,11 +11,24 @@ if hasattr(os, "add_dll_directory"):
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QPainter, QColor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QListWidget,
-                               QListWidgetItem, QComboBox, QPushButton, QLabel, QFileDialog, QMessageBox)
+                               QListWidgetItem, QComboBox, QPushButton, QLabel, QFileDialog, QMessageBox, QCheckBox)
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", HERE)) / "ClipTrimmer"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG = CONFIG_DIR / "config.json"
+LOGFILE = CONFIG_DIR / "cliptrimmer.log"
+VERSION = "1.0.1"
+logging.basicConfig(handlers=[logging.handlers.RotatingFileHandler(LOGFILE, maxBytes=1_000_000, backupCount=2,
+                    encoding="utf-8")], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("ct")
+
+
+def _excepthook(t, v, tb):
+    log.error("UNCAUGHT EXCEPTION\n%s", "".join(traceback.format_exception(t, v, tb)))
+    sys.__excepthook__(t, v, tb)
+
+
+sys.excepthook = _excepthook
 EXTS = {".mp4", ".mkv", ".mov"}
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -25,68 +38,72 @@ def fmt(t):
 
 
 def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, creationflags=NOWIN)
+    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=NOWIN)
+    log.info("RUN %s -> rc=%s", " ".join(f'"{c}"' if " " in c else c for c in cmd), r.returncode)
+    if r.returncode != 0:
+        log.error("stderr: %s", r.stderr[-2000:])
+    return r
+
+
+def probe(path):
+    """Return dict with video size/codec/fps and audio track count."""
+    r = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate:format=duration",
+             "-of", "json", path])
+    try:
+        d = json.loads(r.stdout)
+        st = d.get("streams", [])
+        v = next((x for x in st if x.get("codec_type") == "video"), {})
+        return {"codec": v.get("codec_name"), "w": v.get("width"), "h": v.get("height"), "fps": v.get("r_frame_rate"),
+                "audio": sum(1 for x in st if x.get("codec_type") == "audio"),
+                "dur": float(d.get("format", {}).get("duration", 0))}
+    except Exception:
+        log.exception("probe failed for %s", path)
+        return {}
 
 
 # ---------------------------------------------------------------- trimming engine
-def next_keyframe(src, s):
-    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{s}%+12",
-             "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", src])
-    for line in r.stdout.splitlines():
-        p = line.split(",")
-        if len(p) >= 2 and "K" in p[1]:
-            try:
-                t = float(p[0])
-            except ValueError:
-                continue
-            if t >= s - 0.001:
-                return t
-    return None
-
-
 def encoder_args(src):
-    codec = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
-                 "-of", "csv=p=0", src]).stdout.strip()
-    hevc = codec == "hevc"
+    hevc = (probe(src).get("codec") == "hevc")
     nv = ["-c:v", "hevc_nvenc" if hevc else "h264_nvenc", "-preset", "p7", "-tune", "hq",
-          "-rc", "vbr", "-cq", "12", "-b:v", "0"]
-    cpu = ["-c:v", "libx265" if hevc else "libx264", "-crf", "12", "-preset", "slow"]
+          "-rc", "vbr", "-cq", "10", "-b:v", "0"]
+    cpu = ["-c:v", "libx265" if hevc else "libx264", "-crf", "10", "-preset", "slow"]
     return nv, cpu
 
 
-def trim(src, s, e, dst):
-    """Frame-accurate cut: copy everything, re-encode only the few frames before the first keyframe."""
-    maps = ["-map", "0:v:0", "-map", "0:a?", "-dn", "-sn"]
-    base = ["ffmpeg", "-y", "-v", "error", "-avoid_negative_ts", "make_zero"]
-    k = next_keyframe(src, s)
-    nv, cpu = encoder_args(src)
-    tmp = Path(tempfile.mkdtemp(dir=Path(dst).parent))
+def trim(src, s, e, dst, clean):
+    """Lossless mode: video/audio are stream-copied (bit-exact); the cut start is exact on playback.
+    Clean mode: video is re-encoded near-lossless (NVENC) so the file contains only the trimmed range."""
+    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{s}", "-i", src, "-t", f"{e - s}",
+            "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn"]
+    if clean:
+        nv, cpu = encoder_args(src)
+        attempts = [base + enc + ["-c:a", "copy", "-movflags", "+faststart", dst] for enc in (nv, cpu)]
+    else:
+        attempts = [base + ["-c", "copy", "-movflags", "+faststart", dst]]
+    err = ""
+    for cmd in attempts:
+        r = run(cmd)
+        if r.returncode == 0:
+            return
+        err = r.stderr
+    raise RuntimeError(err[-600:] or "ffmpeg failed")
 
-    def go(cmds):
-        for c in cmds:
-            r = run(c)
-            if r.returncode == 0:
-                return
-            err = r.stderr
-        raise RuntimeError(err[-600:])
 
-    try:
-        if k is not None and k - s < 0.04:  # already on a keyframe: pure stream copy
-            go([base + ["-ss", f"{k + 0.001}", "-i", src, "-t", f"{e - k}"] + maps +
-                ["-c", "copy", "-movflags", "+faststart", dst]])
-        elif k is None or k >= e:  # whole cut sits inside one GOP: re-encode it
-            go([base + ["-ss", f"{s}", "-i", src, "-t", f"{e - s}"] + maps + enc + ["-c:a", "copy", dst]
-                for enc in (nv, cpu)])
-        else:
-            a, b, lst = tmp / "a.ts", tmp / "b.ts", tmp / "l.txt"
-            go([base + ["-ss", f"{s}", "-i", src, "-t", f"{k - s}"] + maps + enc + ["-c:a", "copy", str(a)]
-                for enc in (nv, cpu)])
-            go([base + ["-ss", f"{k + 0.001}", "-i", src, "-t", f"{e - k}"] + maps + ["-c", "copy", str(b)]])
-            lst.write_text(f"file '{a.as_posix()}'\nfile '{b.as_posix()}'\n")
-            go([["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-map", "0",
-                 "-c", "copy", "-movflags", "+faststart", dst]])
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+def verify(src, dst, s, e):
+    """Return None if the output looks good, else a description of the problem."""
+    a, b = probe(src), probe(dst)
+    log.info("verify src=%s dst=%s want=%.3f", a, b, e - s)
+    if not b or not b.get("w") or not b.get("h"):
+        return "output has no valid video stream"
+    if b.get("audio") != a.get("audio"):
+        return f"audio tracks: expected {a.get('audio')}, got {b.get('audio')}"
+    if abs(b.get("dur", 0) - (e - s)) > 0.75:
+        return f"duration {b.get('dur', 0):.2f}s, expected about {e - s:.2f}s"
+    for args in (["-t", "2"], ["-sseof", "-2"]):  # decode start and end to catch broken frames
+        r = run(["ffmpeg", "-v", "error"] + args + ["-i", dst, "-f", "null", "-"])
+        if r.returncode != 0 or "error" in r.stderr.lower():
+            return "decode errors: " + r.stderr[-300:]
+    return None
 
 
 def edit_name(p):
@@ -152,7 +169,7 @@ class Timeline(QWidget):
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ClipTrimmer")
+        self.setWindowTitle(f"ClipTrimmer {VERSION}")
         self.resize(1400, 820)
         self.cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
         self.clips, self.cur, self.init_pending = [], None, False
@@ -172,6 +189,10 @@ class Main(QMainWindow):
                          ("Set end (O)", self.set_b), ("Audio track", self.cycle_audio)]:
             row.addWidget(btn(text, fn))
         row.addStretch()
+        self.clean = QCheckBox("Clean cut (re-encode)")
+        self.clean.setToolTip("Off = lossless copy. On = near-lossless re-encode so the file holds only the trimmed range.")
+        row.addWidget(self.clean)
+        row.addWidget(btn("Open log folder", self.open_log))
         row.addWidget(btn("Save as new", lambda: self.export(False)))
         row.addWidget(btn("Replace original", lambda: self.export(True)))
         left = QVBoxLayout()
@@ -196,7 +217,8 @@ class Main(QMainWindow):
         import mpv
         self.player = mpv.MPV(wid=str(int(self.video.winId())), vo="gpu", hwdec="auto-safe", keep_open="yes",
                               osc=False, input_default_bindings=False, input_vo_keyboard=False,
-                              hr_seek="yes", pause=True)
+                              hr_seek="yes", pause=True,
+                              log_handler=lambda l, c, t: log.info("mpv[%s] %s", c, t.strip()), loglevel="warn")
         for key, fn in [("Space", self.toggle), ("Left", lambda: self.step(-1)), ("Right", lambda: self.step(1)),
                         ("Shift+Left", lambda: self.jump(-5)), ("Shift+Right", lambda: self.jump(5)),
                         ("I", self.set_a), ("O", self.set_b)]:
@@ -256,6 +278,7 @@ class Main(QMainWindow):
             self.load(self.shown[i][1])
 
     def load(self, p):
+        log.info("LOAD %s %s", p, probe(str(p)))
         self.cur, self.init_pending = p, True
         self.player.loadfile(str(p))
         self.player.pause = True
@@ -301,37 +324,57 @@ class Main(QMainWindow):
     def export(self, replace):
         if not self.cur:
             return
-        src, s, e = self.cur, self.tl.a, self.tl.b
+        src, s, e, clean = self.cur, self.tl.a, self.tl.b, self.clean.isChecked()
+        log.info("EXPORT replace=%s clean=%s src=%s start=%.3f end=%.3f", replace, clean, src, s, e)
         if replace and QMessageBox.question(self, "Replace original",
-                                            "Overwrite the original clip with the trimmed version?") != QMessageBox.Yes:
+                "Replace the original with the trimmed version?\nThe original goes to the Recycle Bin.") != QMessageBox.Yes:
             return
-        dst = src.with_name(src.stem + ".trimming" + src.suffix) if replace else edit_name(src)
+        out = edit_name(src)
+        tmp = src.with_name(src.stem + ".trimming" + src.suffix)
+        target = tmp if replace else out
         self.status.setText("Exporting…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
+        final = src
         try:
-            trim(str(src), s, e, str(dst))
+            trim(str(src), s, e, str(target), clean)
+            problem = verify(str(src), str(target), s, e)
+            if problem:
+                raise RuntimeError("Verification failed, original untouched: " + problem)
             if replace:
+                from send2trash import send2trash
                 st = src.stat()
                 self.player.command("stop")  # release the file lock on Windows
-                os.replace(dst, src)
+                send2trash(str(src))
+                os.replace(tmp, src)
                 os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))
-                dst = src
-            self.status.setText(f"Saved: {dst.name}")
+            else:
+                final = out
+            log.info("EXPORT ok -> %s", final)
+            self.status.setText(f"Saved: {final.name}")
         except Exception as ex:
-            if replace and dst.exists():
-                dst.unlink()
-            QMessageBox.critical(self, "Export failed", str(ex))
-            self.status.setText("Export failed")
+            log.exception("EXPORT failed")
+            if target.exists() and (replace or not src.samefile(target)):
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            QMessageBox.critical(self, "Export failed", f"{ex}\n\nDetails are in the log: {LOGFILE}")
+            self.status.setText("Export failed (see log)")
         finally:
             QApplication.restoreOverrideCursor()
         self.scan()
-        self.load(dst if dst.exists() else src)
+        self.load(final if final.exists() else src)
+
+    def open_log(self):
+        os.startfile(str(CONFIG_DIR))
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     locale.setlocale(locale.LC_NUMERIC, "C")  # mpv requires this
+    log.info("ClipTrimmer %s starting; log=%s", VERSION, LOGFILE)
+    log.info("%s", run(["ffmpeg", "-version"]).stdout.splitlines()[:1])
     w = Main()
     w.show()
     sys.exit(app.exec())
