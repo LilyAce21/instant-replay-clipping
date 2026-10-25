@@ -14,13 +14,14 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt
-      - name: Get ffmpeg
+      - name: Get ffmpeg (shared build, DLLs stored once)
         shell: pwsh
         run: |
-          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile ff.zip
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip -OutFile ff.zip
           Expand-Archive ff.zip ff
-          Copy-Item (Get-ChildItem ff -Recurse -Filter ffmpeg.exe).FullName .
-          Copy-Item (Get-ChildItem ff -Recurse -Filter ffprobe.exe).FullName .
+          $bin = (Get-ChildItem ff -Recurse -Filter ffmpeg.exe).DirectoryName
+          New-Item -ItemType Directory ffbin | Out-Null
+          Copy-Item "$bin\*.dll", "$bin\ffmpeg.exe", "$bin\ffprobe.exe" ffbin
       - name: Get libmpv
         shell: pwsh
         env:
@@ -30,7 +31,18 @@ jobs:
           7z x (Get-ChildItem mpvdev -Filter *.7z).FullName -ompv
           Copy-Item (Get-ChildItem mpv -Recurse -Filter libmpv-2.dll).FullName .
       - name: Build exe
-        run: pyinstaller --noconfirm --windowed --name ClipTrimmer --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "libmpv-2.dll;." cliptrimmer.py
+        run: pyinstaller --noconfirm --windowed --name ClipTrimmer --add-data "ffbin;ffmpeg" --add-binary "libmpv-2.dll;." --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtPdf --exclude-module PySide6.QtNetwork cliptrimmer.py
+      - name: Strip unused Qt parts
+        shell: pwsh
+        run: |
+          $q = "dist/ClipTrimmer/_internal/PySide6"
+          Remove-Item "$q/opengl32sw.dll", "$q/Qt6Pdf.dll", "$q/Qt6Quick*.dll", "$q/Qt6Qml*.dll", "$q/Qt6VirtualKeyboard.dll" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$q/translations" -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Self-test the built app
+        shell: pwsh
+        run: |
+          $p = Start-Process "dist/ClipTrimmer/ClipTrimmer.exe" -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Self-test failed with exit code $($p.ExitCode)" }
       - name: Zip
         shell: pwsh
         run: Compress-Archive dist/ClipTrimmer ClipTrimmer-windows.zip

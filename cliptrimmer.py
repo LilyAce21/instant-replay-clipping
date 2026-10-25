@@ -4,9 +4,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BUNDLE = Path(getattr(sys, "_MEIPASS", HERE))  # where ffmpeg/ffprobe/libmpv live
-os.environ["PATH"] = str(BUNDLE) + os.pathsep + os.environ.get("PATH", "")
+os.environ["PATH"] = os.pathsep.join([str(BUNDLE), str(BUNDLE / "ffmpeg"), os.environ.get("PATH", "")])
 if hasattr(os, "add_dll_directory"):
     os.add_dll_directory(str(BUNDLE))
+    if (BUNDLE / "ffmpeg").is_dir():
+        os.add_dll_directory(str(BUNDLE / "ffmpeg"))
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QPainter, QColor, QShortcut, QKeySequence
@@ -17,7 +19,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", HERE)) / "ClipTrimmer"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG = CONFIG_DIR / "config.json"
 LOGFILE = CONFIG_DIR / "cliptrimmer.log"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 logging.basicConfig(handlers=[logging.handlers.RotatingFileHandler(LOGFILE, maxBytes=1_000_000, backupCount=2,
                     encoding="utf-8")], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ct")
@@ -109,6 +111,8 @@ def verify(src, dst, s, e):
 def edit_name(p):
     m = re.match(r"^(.*?) (\d{4}\.\d{2}\.\d{2} - .+)$", p.name)
     name = f"{m[1]} [EDIT] {m[2]}" if m else f"{p.stem} [EDIT]{p.suffix}"
+    if "[EDIT]" in p.name:
+        name = p.name  # already an edit: just number it
     out, n = p.with_name(name), 2
     while out.exists():
         out = p.with_name(Path(name).stem + f" ({n})" + p.suffix)
@@ -372,6 +376,10 @@ class Main(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    if "--selftest" in sys.argv:  # used by the build to make sure nothing needed was stripped out
+        ok = run(["ffmpeg", "-version"]).returncode == 0 and run(["ffprobe", "-version"]).returncode == 0
+        import mpv  # raises if libmpv cannot be loaded
+        sys.exit(0 if ok else 1)
     locale.setlocale(locale.LC_NUMERIC, "C")  # mpv requires this
     log.info("ClipTrimmer %s starting; log=%s", VERSION, LOGFILE)
     log.info("%s", run(["ffmpeg", "-version"]).stdout.splitlines()[:1])
